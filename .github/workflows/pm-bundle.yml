@@ -77,7 +77,7 @@ jobs:
           - label: darwin-x64
             runner: macos-15-intel
           - label: win32-x64
-            runner: windows-latest-32-core
+            runner: blacksmith-32vcpu-windows-2025
           - label: win32-arm64
             runner: windows-latest-32-arm-core
     steps:

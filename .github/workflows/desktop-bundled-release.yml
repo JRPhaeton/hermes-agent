@@ -454,7 +454,7 @@ jobs:
       matrix:
         target:
           - label: win32-x64
-            runner: windows-latest-32-core
+            runner: blacksmith-32vcpu-windows-2025
     env: &win32-env
       CHANNEL_BUILD: ${{ needs.validate.outputs.channel-build }}
       HERMES_DESKTOP_VARIANT: bundled

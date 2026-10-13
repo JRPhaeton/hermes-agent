@@ -101,7 +101,7 @@ jobs:
       update-ref: ${{ inputs.update-ref }}
       tag-has-desktop: ${{ inputs.tag-has-desktop }}
       leg-id: ${{ inputs.leg-id }}
-      runner: macos-latest
+      runner: blacksmith-12vcpu-macos-latest
       timeout-minutes: ${{ inputs.timeout-minutes }}
 
   # ---- arm 2: the published dmg, then Playwright drives the app ------------
