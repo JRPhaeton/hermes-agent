@@ -65,13 +65,13 @@ concurrency:
 jobs:
   check:
     name: python -m pm.build_env --source . --check-lock
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       review_status: ${{ steps.verify.outputs.review_status }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        uses: useblacksmith/checkout@v1
         with:
           ref: ${{ inputs.commit }}
 

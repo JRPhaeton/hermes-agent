@@ -18,10 +18,10 @@ permissions:
 jobs:
   check-profile-artifacts:
     name: Reject profile archives
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - useblacksmith/checkout@v1
         with:
           ref: ${{ inputs.commit }}
       - name: Reject profile exports in the checkout
