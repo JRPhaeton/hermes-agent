@@ -27,7 +27,7 @@ concurrency:
 jobs:
   tag:
     name: Tag, draft, and start the canary build
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # A dispatch from a feature branch would tag unmerged code as the canary.
     if: github.ref_name == github.event.repository.default_branch
     steps:
@@ -48,7 +48,7 @@ jobs:
 
   prune:
     name: Prune canaries older than 14 days
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: tag
     environment: release-signing
     # Prune even when this run had nothing new to tag. The desktop build

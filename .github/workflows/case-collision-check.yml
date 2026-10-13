@@ -29,7 +29,7 @@ permissions:
 
 jobs:
   check-case-collisions:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: useblacksmith/checkout@v1

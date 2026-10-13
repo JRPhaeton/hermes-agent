@@ -71,7 +71,7 @@ jobs:
   # the parent stable-release workflow, which passes the candidate commit.
   mode:
     name: Resolve release phase
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
       phase: ${{ steps.resolve.outputs.phase }}
@@ -100,7 +100,7 @@ jobs:
     name: Detect affected areas
     needs: [mode]
     if: needs.mode.outputs.release != 'true'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     outputs:
       build: ${{ steps.gate.outputs.build }}
@@ -443,7 +443,7 @@ jobs:
     # `needs` is the whole 4-leg matrix: only publish both :main variants
     # after every arch and variant publisher succeeds.
     if: ${{ !cancelled() && needs.mode.outputs.release != 'true' && github.repository == 'NousResearch/hermes-agent' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: [mode, publish]
     timeout-minutes: 10
     environment: container-publish
@@ -628,7 +628,7 @@ jobs:
     name: Assemble versioned manifest and digest receipt
     if: needs.mode.outputs.phase == 'publish'
     needs: [mode, release-publish]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       digest: ${{ steps.list.outputs.digest }}
     timeout-minutes: 15
@@ -760,7 +760,7 @@ jobs:
     name: Docker phase requirements met
     if: always() && inputs.release-phase != ''
     needs: [mode, build, release-publish, release-publish-manifest]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - name: Validate phase job results

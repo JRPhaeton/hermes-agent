@@ -23,7 +23,7 @@ permissions:
 jobs:
   check-freshness:
     if: github.repository == 'NousResearch/hermes-agent'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     environment: trusted-automation
     steps:
@@ -176,7 +176,7 @@ jobs:
     # chain lacks Access-Control-Allow-Origin (#136483). The probe above uses
     # curl -L, which never checks CORS, so it stays green while Desktop is blocked.
     if: github.repository == 'NousResearch/hermes-agent'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     environment: trusted-automation
     steps:

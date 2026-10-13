@@ -206,7 +206,7 @@ jobs:
     # One dispatch: in disposable mode the allocation steps run first (the
     # channel pin comes from them), then admission validates the build source.
     # A failed allocation fails this job and skips everything downstream.
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # Public root is an environment variable, not a repository variable. No
     # secret is injected into admission; downstream jobs consume its outputs.
     environment: release-signing
@@ -799,7 +799,7 @@ jobs:
     # The trust-branch legs are read through needs.*.result below, so they must
     # stay in the list — the result job gates on their outcomes, not its own.
     needs: [validate, build-win32-x64-release, build-win32-x64-commit]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions: {}
     timeout-minutes: 5
     env:
@@ -826,7 +826,7 @@ jobs:
     # The trust-branch legs are read through needs.*.result below, so they must
     # stay in the list — the result job gates on their outcomes, not its own.
     needs: [validate, build-win32-arm64-release, build-win32-arm64-commit]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions: {}
     timeout-minutes: 5
     env:
@@ -1215,7 +1215,7 @@ jobs:
     # The trust-branch legs are read through needs.*.result below, so they must
     # stay in the list — the result job gates on their outcomes, not its own.
     needs: [validate, build-darwin-arm64-release, build-darwin-arm64-commit]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions: {}
     timeout-minutes: 5
     env:
@@ -1235,7 +1235,7 @@ jobs:
     # The trust-branch legs are read through needs.*.result below, so they must
     # stay in the list — the result job gates on their outcomes, not its own.
     needs: [validate, build-darwin-x64-release, build-darwin-x64-commit]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions: {}
     timeout-minutes: 5
     env:
@@ -1249,7 +1249,7 @@ jobs:
     name: bundled linux-x64 (disabled for now)
     if: needs.validate.outputs.linux-x64 == 'true'
     needs: validate
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - name: Disabled
@@ -1260,7 +1260,7 @@ jobs:
     name: bundled linux-arm64 (disabled for now)
     if: needs.validate.outputs.linux-arm64 == 'true'
     needs: validate
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - name: Disabled
@@ -1278,7 +1278,7 @@ jobs:
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.validate.outputs.darwin-arm64 == 'true'
       && needs.build-darwin-arm64.result == 'success'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: release-signing
     timeout-minutes: 15
     outputs:
@@ -1312,7 +1312,7 @@ jobs:
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.validate.outputs.darwin-x64 == 'true'
       && needs.build-darwin-x64.result == 'success'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: release-signing
     timeout-minutes: 15
     outputs:
@@ -1678,7 +1678,7 @@ jobs:
       && needs.assemble-win32-bundle.result == 'success'
       && needs.smoke-darwin-arm64.result == 'success' && needs.smoke-darwin-x64.result == 'success'
       && needs.smoke-win32-arm64.result == 'success' && needs.smoke-win32-x64.result == 'success'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: release-signing
     cache-mode: read
     timeout-minutes: 45
@@ -1727,7 +1727,7 @@ jobs:
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.assemble-win32-bundle.result == 'success'
       && needs.smoke-win32-arm64.result == 'success' && needs.smoke-win32-x64.result == 'success'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: release-signing
     timeout-minutes: 15
     concurrency:
@@ -1807,7 +1807,7 @@ jobs:
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.build-darwin-arm64.result == 'success' && needs.build-darwin-x64.result == 'success'
       && needs.smoke-darwin-arm64.result == 'success' && needs.smoke-darwin-x64.result == 'success'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: release-signing
     timeout-minutes: 15
     concurrency:
@@ -1869,7 +1869,7 @@ jobs:
     name: Build + publish the termux .deb (aarch64)
     needs: [validate]
     if: inputs.channel == '' && inputs.disposable_channel == '' && needs.validate.outputs.termux == 'true' && (inputs.upload_release == true || inputs.release-phase == 'candidate' || inputs.build_commit != '')
-    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     environment: release-signing
     timeout-minutes: 90
     env:
@@ -2238,7 +2238,7 @@ jobs:
     needs: validate
     # Pairs with builds-table: a pending page nothing finalizes must not be written.
     if: inputs.build_commit == '' && inputs.upload_release == true && needs.validate.outputs.all-jobs == 'true'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: useblacksmith/checkout@v1
         with:
@@ -2283,7 +2283,7 @@ jobs:
       always() && inputs.build_commit == '' && inputs.channel == '' && inputs.upload_release == true && inputs.release-phase == ''
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.validate.outputs.all-jobs == 'true'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: release-signing
     steps:
       - uses: useblacksmith/checkout@v1
@@ -2341,7 +2341,7 @@ jobs:
       always() && inputs.build_commit != '' && inputs.channel == '' && inputs.disposable_channel == ''
       && needs.validate.result == 'success' && needs.validate.outputs.sha != ''
       && needs.validate.outputs.all-jobs == 'true'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: release-signing
     permissions:
       contents: write
@@ -2496,7 +2496,7 @@ jobs:
         stable-publish,
         stable-store
       ]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: useblacksmith/checkout@v1
         with:
@@ -2556,7 +2556,7 @@ jobs:
       && needs.smoke-win32-arm64.result == 'success' && needs.smoke-win32-x64.result == 'success'
       && needs.publish-win32-updater.result == 'success'
       && needs.publish-darwin-updater.result == 'success'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: release-signing
     steps:
       - uses: useblacksmith/checkout@v1

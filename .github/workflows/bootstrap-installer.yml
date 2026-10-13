@@ -26,7 +26,7 @@ concurrency:
 jobs:
   posix:
     name: install.sh protocol + small fresh-install E2E
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     # NOTE: `runner.temp` is only available in step-level env, not job-level
     # env — a job-env `${{ runner.temp }}` makes GitHub reject the workflow

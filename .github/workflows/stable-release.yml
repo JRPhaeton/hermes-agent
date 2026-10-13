@@ -38,7 +38,7 @@ jobs:
     # that can read it.
     permissions:
       contents: write
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       claim-tag: ${{ steps.admit.outputs.claim-tag }}
       claim-object: ${{ steps.admit.outputs.claim-object }}
@@ -291,7 +291,7 @@ jobs:
     name: Pin actual OLD and NEW signed packages (darwin-arm64)
     needs: [admit, candidates-darwin-arm64]
     if: needs.admit.outputs.skip-tests != 'true'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: release-signing
     outputs:
       windows: ${{ steps.plan.outputs.windows }}
@@ -326,7 +326,7 @@ jobs:
     name: Pin actual OLD and NEW signed packages (darwin-x64)
     needs: [admit, candidates-darwin-x64]
     if: needs.admit.outputs.skip-tests != 'true' && needs.admit.outputs.include-macos-intel == 'true'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: release-signing
     outputs:
       windows: ${{ steps.plan.outputs.windows }}
@@ -361,7 +361,7 @@ jobs:
     name: Pin actual OLD and NEW signed packages (win32)
     needs: [admit, candidates-win32-bundle]
     if: needs.admit.outputs.skip-tests != 'true'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: release-signing
     outputs:
       windows: ${{ steps.plan.outputs.windows }}
@@ -401,7 +401,7 @@ jobs:
     if: always() && needs.admit.outputs.skip-bundles != 'true'
     needs: [admit, candidates-darwin-arm64, candidates-darwin-x64, candidates-win32-arm64,
             candidates-win32-x64, candidates-win32-bundle, candidates-termux]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: release-signing
     timeout-minutes: 90
     outputs:
@@ -490,7 +490,7 @@ jobs:
     name: Bootstrap installer release identity
     needs: admit
     if: needs.admit.outputs.skip-tests != 'true'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: useblacksmith/checkout@v1
         with:
@@ -529,7 +529,7 @@ jobs:
             candidate-manifest, transitions-darwin-arm64, transitions-darwin-x64,
             transitions-win32, windows-packaged, macos-packaged-arm64, macos-packaged-x64,
             bootstrap-version]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: useblacksmith/checkout@v1
         with:
@@ -585,7 +585,7 @@ jobs:
     name: All artifact publication succeeded
     if: always()
     needs: [admit, acceptance, publish-docker, publish-bundles]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: useblacksmith/checkout@v1
         with:
@@ -606,7 +606,7 @@ jobs:
     if: always()
     needs: [admit, ci, docker, acceptance, candidate-manifest, publication, publish-docker,
             windows-packaged, macos-packaged-arm64, macos-packaged-x64]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: release-signing
     permissions:
       contents: write

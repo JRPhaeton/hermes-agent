@@ -3,8 +3,8 @@
 # the real findings, unless this file declares it.
 self-hosted-runner:
   labels:
-    - blacksmith-2vcpu-ubuntu-2404
-    - blacksmith-2vcpu-ubuntu-2404-arm
+    - blacksmith-4vcpu-ubuntu-2404
+    - blacksmith-4vcpu-ubuntu-2404-arm
     - blacksmith-2vcpu-windows-2025
     - blacksmith-12vcpu-macos-latest
     - blacksmith-32vcpu-ubuntu-2404

@@ -18,7 +18,7 @@ permissions:
 jobs:
   check-profile-artifacts:
     name: Reject profile archives
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - useblacksmith/checkout@v1
