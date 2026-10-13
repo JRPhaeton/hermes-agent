@@ -6,6 +6,7 @@ from pathlib import Path
 from ruamel.yaml import YAML
 
 from tests.ci.desktop_release_roles import gate
+from tests.ci.workflow_steps import is_checkout
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -240,7 +241,7 @@ def test_claim_custody_and_final_payload_identity_reach_every_privileged_phase()
 
 def test_docker_dev_stamp_checkout_has_release_history():
     build = workflow("docker.yml")["jobs"]["build"]
-    checkout = next(step for step in build["steps"] if "actions/checkout@" in step.get("uses", ""))
+    checkout = next(step for step in build["steps"] if is_checkout(step))
 
     assert checkout["with"]["fetch-depth"] == "0"
 
