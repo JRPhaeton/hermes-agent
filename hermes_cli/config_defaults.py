@@ -1484,7 +1484,16 @@ DEFAULT_CONFIG = {
     },
 
     "telegram": {
-        "reactions": False,  # add 👀/✅/❌ reactions to messages during processing
+        "reactions": False,  # 👀 / 👍 / 👎 lifecycle reactions on the user's message (bot-settable emoji only)
+        # Per-phase override for the lifecycle reactions; null disables that phase (👀 is cleared instead).
+        "reaction_emojis": {"processing": "👀", "success": "👍", "failure": "👎"},
+        # Inline keyboards on clarify / exec-approval / slash-confirm prompts. false = plain-text prompts
+        # answered by typing (1, option text, /approve, /deny ...).
+        "buttons": True,
+        # The user's reaction on one of the bot's messages becomes a user turn. false = off (legacy);
+        # true = built-in map {👍/👌: "yes", 👎: "no"}; or a map {emoji | custom:<id>: text}. Unmapped
+        # emoji and reaction removals never start a turn. ✅/❌ are NOT Telegram reactions — use 👍/👎.
+        "reaction_replies": False,
         # per-chat/topic ephemeral system prompts (topics inherit from parent group)
         "channel_prompts": {},
         "allowed_chats": "",  # if set, ONLY respond in these group/supergroup chat IDs
