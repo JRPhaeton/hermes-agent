@@ -9,16 +9,18 @@ name: Docs Search Monitor
 # bundle the site is serving, queries Algolia with the site's Origin, opens the
 # top results, then types into the real search modal in headless Chromium.
 #
-# Alerts go to Telegram when search goes down, every 6 hours while it stays
-# down, and once when it recovers. Configure on the `trusted-automation`
-# environment (main-only, so branch workflows cannot read the bot token):
+# Runs every 6 hours and after every Deploy Site run. Every failing run sends
+# a Telegram alert (so a 6-hourly reminder while it stays down), and the first
+# passing run after a failure sends a recovery message. Configure on the
+# `trusted-automation` environment (main-only, so branch workflows cannot
+# read the bot token):
 #   DOCS_ALERT_TELEGRAM_BOT_TOKEN  bot token from @BotFather
 #   DOCS_ALERT_TELEGRAM_CHAT_ID    chat to notify (your user id or a group id)
 # Without them the job still goes red; it just has nobody to tell.
 
 on:
   schedule:
-    - cron: '17 * * * *'
+    - cron: '17 */6 * * *'
   workflow_run:
     workflows: ['Deploy Site']
     types: [completed]
@@ -94,16 +96,12 @@ jobs:
             if [ "$c" = success ] || [ "$c" = failure ]; then prev=$c; break; fi
           done
           echo "previous probe verdict: $prev"
-          hour=$(date -u +%H)
           if [ "$TEST_ALERT" = true ]; then
             text="Test alert from the docs search monitor (probe: $OUTCOME). $RUN_URL"
           elif [ "$OUTCOME" = success ]; then
             [ "$prev" = failure ] || { echo "healthy, nothing to send"; exit 0; }
             text="Docs search is working again. $RUN_URL"
           elif [ "$OUTCOME" = failure ]; then
-            if [ "$prev" = failure ] && [ $((10#$hour % 6)) -ne 0 ]; then
-              echo "still broken; already alerted (next reminder on a 6-hour mark)"; exit 0
-            fi
             text="Docs search is BROKEN on hermes-agent.nousresearch.com/docs
           ${REASON:-probe failed before it could name a reason}
           $RUN_URL"
