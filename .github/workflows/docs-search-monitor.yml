@@ -1,0 +1,114 @@
+name: Docs Search Monitor
+
+# Live check that search works on hermes-agent.nousresearch.com/docs, with a
+# Telegram alert when it breaks. Search broke in production twice in one
+# month with every build green (a deleted Algolia search key, then Vercel
+# access controls), because nothing ever exercised the deployed site.
+#
+# website/scripts/check-live-search.mjs reads the Algolia credentials from the
+# bundle the site is serving, queries Algolia with the site's Origin, opens the
+# top results, then types into the real search modal in headless Chromium.
+#
+# Alerts go to Telegram when search goes down, every 6 hours while it stays
+# down, and once when it recovers. Configure on the `trusted-automation`
+# environment (main-only, so branch workflows cannot read the bot token):
+#   DOCS_ALERT_TELEGRAM_BOT_TOKEN  bot token from @BotFather
+#   DOCS_ALERT_TELEGRAM_CHAT_ID    chat to notify (your user id or a group id)
+# Without them the job still goes red; it just has nobody to tell.
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_run:
+    workflows: ['Deploy Site']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: 'Send a test Telegram message to confirm the alert wiring'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: docs-search-monitor
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: github.repository == 'NousResearch/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: trusted-automation
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          sparse-checkout: website/scripts
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # 7.0.0
+        with:
+          node-version: 24.11.1
+
+      - name: Install headless Chromium
+        run: |
+          npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/pw" playwright@1.62.1
+          npx --prefix "$RUNNER_TEMP/pw" playwright install --with-deps chromium-headless-shell
+
+      - name: Probe live docs search
+        id: probe
+        env:
+          PLAYWRIGHT_DIR: ${{ runner.temp }}/pw
+        run: |
+          # One retry after a pause so a transient blip never pages anyone.
+          if node website/scripts/check-live-search.mjs; then exit 0; fi
+          echo "::warning::first probe failed; retrying in 90s"
+          sleep 90
+          node website/scripts/check-live-search.mjs
+
+      - name: Telegram alert
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOKEN: ${{ secrets.DOCS_ALERT_TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.DOCS_ALERT_TELEGRAM_CHAT_ID }}
+          OUTCOME: ${{ steps.probe.outcome }}
+          TEST_ALERT: ${{ inputs.test_alert }}
+          REASON: ${{ steps.probe.outputs.reason }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          prev=$(gh run list -R "$GITHUB_REPOSITORY" --workflow docs-search-monitor.yml \
+                   --status completed --limit 10 --json databaseId,conclusion \
+                   --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID and (.conclusion == \"success\" or .conclusion == \"failure\"))][0].conclusion // \"success\"")
+          hour=$(date -u +%H)
+          if [ "$TEST_ALERT" = true ]; then
+            text="Test alert from the docs search monitor (probe: $OUTCOME). $RUN_URL"
+          elif [ "$OUTCOME" = success ]; then
+            [ "$prev" = failure ] || { echo "healthy, nothing to send"; exit 0; }
+            text="Docs search is working again. $RUN_URL"
+          elif [ "$OUTCOME" = failure ]; then
+            if [ "$prev" = failure ] && [ $((10#$hour % 6)) -ne 0 ]; then
+              echo "still broken; already alerted (next reminder on a 6-hour mark)"; exit 0
+            fi
+            text="Docs search is BROKEN on hermes-agent.nousresearch.com/docs
+          ${REASON:-probe failed before it could name a reason}
+          $RUN_URL"
+          else
+            echo "probe step was $OUTCOME; not alerting"; exit 0
+          fi
+          if [ -z "$TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "::warning::DOCS_ALERT_TELEGRAM_BOT_TOKEN / DOCS_ALERT_TELEGRAM_CHAT_ID not set on trusted-automation; alert not sent: $text"
+            exit 0
+          fi
+          # A failed send must not turn the job red: the next run reads this
+          # run's conclusion to decide between "broken" and "working again".
+          if curl -fsS --retry 3 -o /dev/null "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+               --data-urlencode "chat_id=${CHAT_ID}" --data-urlencode "text=${text}" \
+               --data-urlencode "disable_web_page_preview=true"; then
+            echo "alert sent"
+          else
+            echo "::error::Telegram sendMessage failed; check the bot token / chat id"
+          fi
