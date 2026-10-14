@@ -11,8 +11,9 @@
 // Usage: node website/scripts/check-live-search.mjs [--no-browser]
 //   DOCS_URL       site to probe (default https://hermes-agent.nousresearch.com/docs)
 //   PLAYWRIGHT_DIR directory holding node_modules/playwright (browser check)
-// Exit 0 = search works; exit 1 = broken, reasons on stderr and in
-// $GITHUB_STEP_SUMMARY / $GITHUB_OUTPUT (`reason=`) when run in Actions.
+// Exit 0 = search works; exit 1 = broken. Reasons go to stderr and, in
+// Actions, to the step summary and `::error::` annotations (alert receivers
+// read the annotations off the failed run).
 
 import { appendFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -34,6 +35,7 @@ const failures = [];
 const fail = (msg) => {
   failures.push(msg);
   console.error(`FAIL ${msg}`);
+  if (process.env.GITHUB_ACTIONS) console.log(`::error title=Docs search::${msg.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A')}`);
 };
 const ok = (msg) => console.log(`ok   ${msg}`);
 
@@ -170,9 +172,6 @@ function finish() {
   if (process.env.GITHUB_STEP_SUMMARY) {
     const lines = failures.length ? failures.map((f) => `- ${f}`) : ['- all checks passed'];
     appendFileSync(process.env.GITHUB_STEP_SUMMARY, `### Docs search (${DOCS_URL})\n${lines.join('\n')}\n`);
-  }
-  if (process.env.GITHUB_OUTPUT && failures.length) {
-    appendFileSync(process.env.GITHUB_OUTPUT, `reason=${failures[0].replace(/\n/g, ' ').slice(0, 300)}\n`);
   }
   process.exit(failures.length ? 1 : 0);
 }
