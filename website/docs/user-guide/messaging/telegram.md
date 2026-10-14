@@ -1240,7 +1240,7 @@ This covers the custom fallback transport layer that Hermes uses for Telegram co
 
 ## Message Reactions
 
-The bot can add emoji reactions to messages as visual processing feedback:
+The bot can add emoji reactions to **your** message as low-noise processing feedback:
 
 - 👀 when the bot starts processing your message
 - 👍 when the response is delivered successfully
@@ -1259,13 +1259,66 @@ Or via environment variable:
 TELEGRAM_REACTIONS=true
 ```
 
+Override the emoji per phase (set a phase to `null` to clear the 👀 instead of swapping it):
+
+```yaml
+telegram:
+  reactions: true
+  reaction_emojis:
+    processing: "👀"
+    success: "🫡"
+    failure: "👎"
+```
+
 :::note
-Unlike Discord (where reactions are additive), Telegram's Bot API replaces all bot reactions in a single call. The transition from 👀 to 👍/👎 happens atomically — you won't see both at once.
+Bots can only set Telegram's standard reaction set (👍 👎 ❤ 🔥 👀 👌 🙏 🫡 … about 70 emoji). **✅ and ❌ are not in it** — Telegram rejects them and the adapter logs a warning the first time it tries. Unlike Discord (where reactions are additive), Telegram's Bot API replaces all bot reactions in a single call, so the transition from 👀 to 👍/👎 happens atomically.
 :::
 
 :::tip
 If the bot doesn't have permission to add reactions in a group, the reaction calls fail silently and message processing continues normally.
 :::
+
+### Reaction replies — your reaction becomes an answer
+
+With `reaction_replies` on, **your** reaction on one of the **bot's** messages is delivered to the agent as an ordinary user turn — react 👍 to a proposed plan instead of typing "yes":
+
+```yaml
+telegram:
+  reaction_replies: true        # built-in map: 👍 / 👌 → "yes", 👎 → "no"
+```
+
+Or map emoji to the exact text you want sent:
+
+```yaml
+telegram:
+  reaction_replies:
+    "👍": "yes, go ahead"
+    "👎": "no"
+    "🙏": "please summarise this"
+    "custom:5368324170671202286": "ship it"   # Telegram Premium custom emoji, by id
+    "🫡": "/approve"                           # a value starting with / runs as a slash command
+```
+
+Convention and limits:
+
+- Only a **newly added** reaction with a mapped meaning creates a turn. Removing a reaction, or reacting with an unmapped emoji (🔥, ❤, …), never does — so a stray reaction cannot wake the agent.
+- The turn is framed as a reply to the reacted message (`[Replying to your previous message: "…"]`) so the agent knows what "yes" refers to. If that text is unknown (the message predates a gateway restart) the turn reads `[Reacted 👍 to an earlier message in this chat] yes`.
+- In private chats any message counts. In groups only messages **the bot itself sent** count (a 👍 on a human's message is chatter), and the bot must be a group **admin** for Telegram to deliver reaction updates at all.
+- The reactor must pass the same authorization as an inline-button tap (`allow_from`, `TELEGRAM_ALLOWED_USERS`, …); strangers' reactions are ignored.
+- If the agent is mid-turn, the reaction queues like a typed follow-up — it is never injected into a running tool loop, and prompt caching is unaffected. Reacting to a clarify prompt does **not** pick an option; tap its button.
+- Works in both polling and webhook mode (the adapter already requests `message_reaction` updates).
+- Environment override: `TELEGRAM_REACTION_REPLIES=true|false|<JSON map>`.
+
+## Inline Buttons
+
+Clarify questions, dangerous-command approvals and slash-command confirmations render as inline keyboards (numbered choice buttons plus **✏️ Other**; **Allow Once / Session / Always / Deny**; **Approve Once / Always Approve / Cancel**). A tap resolves the pending prompt in the running session exactly as if you had typed the answer, and the tapper must pass the same authorization as the chat. A tap on a prompt that has expired (gateway restarted, session reset) is answered with *"This prompt expired — please /retry"* instead of silently showing a ✓.
+
+Buttons are **on by default**. Turn them off to get plain-text prompts you answer by typing (`1`, the option text, `/approve`, `/approve always`, `/deny`, `/always`, `/cancel`):
+
+```yaml
+telegram:
+  buttons: false        # or TELEGRAM_BUTTONS=false
+```
 
 ## Per-Channel Prompts
 

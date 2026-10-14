@@ -1305,6 +1305,19 @@ platform_toolsets:
 #     # Default false; ordinary messages, replies, and regex wake words stay blocked.
 #     guest_mode: false
 #     # allowed_chats: ["-1001234567890"]
+#     # Telegram-native UX (all optional; defaults keep legacy behaviour):
+#     #   buttons: inline keyboards on clarify / approval / slash-confirm prompts (false = text prompts,
+#     #            answer by typing 1 / option text / /approve / /deny). TELEGRAM_BUTTONS overrides.
+#     #   reactions: 👀 while working, 👍 done, 👎 failed — on YOUR message. TELEGRAM_REACTIONS overrides.
+#     #   reaction_emojis: per-phase override; null clears the 👀 instead of swapping it.
+#     #   reaction_replies: YOUR reaction on one of the bot's messages becomes a user turn.
+#     #            true = {👍/👌: "yes", 👎: "no"}; or map emoji (or custom:<custom_emoji_id>) → text;
+#     #            a value starting with / runs as a slash command. Unmapped emoji never start a turn.
+#     #            ✅/❌ are NOT in Telegram's reaction set — use 👍/👎. TELEGRAM_REACTION_REPLIES overrides.
+#     buttons: true
+#     reactions: false
+#     reaction_emojis: {processing: "👀", success: "👍", failure: "👎"}
+#     reaction_replies: false
 #     extra:
 #       disable_link_previews: false  # Set true to suppress Telegram URL previews in bot messages
 #       rich_messages: false          # Bot API 10.1 rich messages (tables/task lists/details/math); default false for copyable legacy MarkdownV2, set true to opt in

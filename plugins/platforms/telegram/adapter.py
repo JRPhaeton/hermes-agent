@@ -10,6 +10,7 @@ import os
 import html as _html
 import re
 import time
+from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
@@ -121,6 +122,10 @@ try:
     from telegram.ext import (
         Application, CommandHandler, CallbackQueryHandler, InlineQueryHandler, MessageHandler as TelegramMessageHandler,
         ContextTypes, TypeHandler, filters)
+    try:
+        from telegram.ext import MessageReactionHandler
+    except ImportError:  # python-telegram-bot < 20.8: fall back to a TypeHandler filter
+        MessageReactionHandler = None
     from telegram.constants import ParseMode, ChatType
     from telegram.request import HTTPXRequest
     TELEGRAM_AVAILABLE = True
@@ -129,6 +134,7 @@ except ImportError:
     Update = Bot = Message = InlineKeyboardButton = InlineKeyboardMarkup = Application = Any
     CommandHandler = CallbackQueryHandler = InlineQueryHandler = TypeHandler = TelegramMessageHandler = HTTPXRequest = Any
     LinkPreviewOptions = filters = ParseMode = ChatType = None
+    MessageReactionHandler = None
 
     # Mock so ContextTypes.DEFAULT_TYPE annotations don't crash class definition without the lib.
     class _MockContextTypes:
@@ -230,7 +236,7 @@ def check_telegram_requirements() -> bool:
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, InlineQueryHandler, TelegramMessageHandler
-    global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest, TypeHandler
+    global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest, TypeHandler, MessageReactionHandler
     if TELEGRAM_AVAILABLE:
         return True
     try:
@@ -248,6 +254,7 @@ def check_telegram_requirements() -> bool:
         Application, CommandHandler, CallbackQueryHandler, InlineQueryHandler, TelegramMessageHandler = (
             getattr(_ext, n) for n in ("Application", "CommandHandler", "CallbackQueryHandler", "InlineQueryHandler", "MessageHandler"))
         ContextTypes, filters, TypeHandler = _ext.ContextTypes, _ext.filters, _ext.TypeHandler
+        MessageReactionHandler = getattr(_ext, "MessageReactionHandler", None)
         ParseMode, ChatType = _const.ParseMode, _const.ChatType
         HTTPXRequest = _req.HTTPXRequest
     except (ImportError, AttributeError):
@@ -517,6 +524,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._approval_state: Dict[int, str] = {}  # message_id → session_key
         self._slash_confirm_state: Dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: Dict[str, str] = {}  # clarify_id → session_key
+        # Messages THIS bot sent, (chat_id, message_id) → text snippet, bounded LRU. Lets an inbound reaction be
+        # attributed to one of our messages (required in groups) and quoted back to the agent (reaction_replies).
+        self._own_message_index: "OrderedDict[tuple, str]" = OrderedDict()
         # "important" (default): only final responses, approvals and slash confirmations notify;
         # "all": every message notifies (display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
@@ -1437,6 +1447,7 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id = getattr(msg, "message_id", None)
         if message_id is not None:
             self._record_rich_sent(chat_id, message_id, content)
+            self._remember_own_message(chat_id, message_id, content)
         return SendResult(success=True, message_id=str(message_id) if message_id is not None else None)
 
     def _rich_payload_base(self, chat_id: str, content: str) -> Dict[str, Any]:
@@ -1474,6 +1485,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return self._rich_transient_result(exc, "rich editMessageText")
         # Mirror the fresh-send index: a streamed final finalized via edit is otherwise never recorded.
         self._record_rich_sent(chat_id, message_id, content)
+        self._remember_own_message(chat_id, message_id, content)
         return SendResult(success=True, message_id=message_id)
 
     def _should_attempt_rich_draft(self, content: str) -> bool:
@@ -2691,6 +2703,12 @@ class TelegramAdapter(BasePlatformAdapter):
             filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
             self._handle_media_message))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+        # Inbound reactions → user turns (telegram.reaction_replies; inert when unset). Own group: PTB runs only
+        # the FIRST matching handler per group, so this must not share group 0 with the message handlers.
+        if MessageReactionHandler is not None and MessageReactionHandler is not Any:
+            app.add_handler(MessageReactionHandler(self._handle_message_reaction), group=1)
+        else:
+            app.add_handler(TypeHandler(Update, self._handle_message_reaction), group=1)
         # Inline command picker; inert until the owner enables inline mode via BotFather /setinline.
         app.add_handler(InlineQueryHandler(self._handle_inline_query))
         # gateway_platform_event observer: group 99 observes alongside, never displaces, core handlers.
@@ -3378,6 +3396,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     return outcome
                 msg, used_thread_fallback = outcome
                 message_ids.append(str(msg.message_id))
+            for _mid in message_ids:
+                self._remember_own_message(chat_id, _mid, content)
             await self._retrigger_typing(chat_id, metadata)
             return SendResult(
                 success=True, message_id=message_ids[0] if message_ids else None,
@@ -3498,6 +3518,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._edit_markdown_or_plain(
                 chat_id, message_id, self.format_message(content), _strip_mdv2(content) if content else content,
                 "[%s] MarkdownV2 edit failed, falling back to plain text: %s")
+            self._remember_own_message(chat_id, message_id, content)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
@@ -3766,6 +3787,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_markup=keyboard, thread_id=thread_id, metadata=metadata, reply_to_mode=reply_to_mode)
             if on_sent is not None:
                 on_sent(msg)
+            self._remember_own_message(chat_id, getattr(msg, "message_id", None), text)
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] %s failed: %s", self.name, what, _redact_telegram_error_text(e))
@@ -3804,7 +3826,15 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None, allow_permanent: bool = True, allow_session: bool = True,
         smart_denied: bool = False) -> SendResult:
         """Send an inline-keyboard approval prompt; buttons call ``resolve_gateway_approval()`` like the
-        text ``/approve`` flow."""
+        text ``/approve`` flow. ``telegram.buttons=false`` sends the gateway's plain-text prompt instead
+        (``/approve`` / ``/approve session`` / ``/approve always`` / ``/deny``)."""
+        if not self._buttons_enabled():
+            from gateway.run import _format_exec_approval_fallback, _interim_metadata
+            text = _format_exec_approval_fallback(
+                command, description, "/", allow_permanent=allow_permanent, allow_session=allow_session,
+                smart_denied=smart_denied)
+            return await self.send(
+                chat_id, text, metadata=_interim_metadata({**(metadata or {}), "is_approval_prompt": True}))
         def build():
             text = self._format_exec_approval(command, description, smart_denied)
             # Short monotonic ids in callback_data map back to session_key.
@@ -3827,7 +3857,10 @@ class TelegramAdapter(BasePlatformAdapter):
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        """Render a three-button slash-command confirmation prompt."""
+        """Render a three-button slash-command confirmation prompt; ``telegram.buttons=false`` declines so
+        the gateway text fallback (``/approve`` / ``/always`` / ``/cancel``) runs instead."""
+        if not self._buttons_enabled():
+            return SendResult(success=False, error="Not supported")
         def build():
             keyboard = InlineKeyboardMarkup([
                 [
@@ -3844,7 +3877,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, question: str, choices: Optional[list], clarify_id: str, session_key: str,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Render a clarify prompt: numbered buttons per choice plus "✏️ Other (type answer)" (flips to
-        text-capture mode); without choices, plain question and the gateway text-intercept captures."""
+        text-capture mode); without choices, plain question and the gateway text-intercept captures.
+        ``telegram.buttons=false`` → the base numbered-list prompt (typed number / option text resolves)."""
+        if not self._buttons_enabled():
+            return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata=metadata)
         def build():
             text = f"❓ {_html.escape(question)}"
             keyboard = None
@@ -6376,27 +6412,253 @@ class TelegramAdapter(BasePlatformAdapter):
         return await self._set_reaction(chat_id, message_id, None)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction when message processing begins."""
-        if not self._reactions_enabled():
+        """Add an in-progress reaction when message processing begins (``reaction_emojis.processing``,
+        default 👀). Skipped for reaction-reply turns: their ``message_id`` is the BOT's message."""
+        if not self._reactions_enabled() or self._is_reaction_reply_event(event):
             return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
-        if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, "\U0001f440")
+        emoji = self._reaction_emojis().get("processing")
+        if chat_id and message_id and emoji:
+            await self._set_reaction(chat_id, message_id, emoji)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for a final success/failure reaction (set_message_reaction
-        replaces, not adds); CANCELLED explicitly clears the 👀."""
-        if not self._reactions_enabled():
+        """Swap the in-progress reaction for the outcome reaction (``reaction_emojis.success`` /
+        ``.failure``, default 👍 / 👎; set_message_reaction replaces, not adds). CANCELLED, or a phase
+        configured to null, explicitly clears the 👀."""
+        if not self._reactions_enabled() or self._is_reaction_reply_event(event):
             return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if not (chat_id and message_id):
             return
-        if outcome == ProcessingOutcome.CANCELLED:
-            await self._clear_reactions(chat_id, message_id)
+        emoji = None if outcome == ProcessingOutcome.CANCELLED else self._reaction_emojis().get(
+            "success" if outcome == ProcessingOutcome.SUCCESS else "failure")
+        if emoji:
+            await self._set_reaction(chat_id, message_id, emoji)
         else:
-            await self._set_reaction(chat_id, message_id, "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e")
+            await self._clear_reactions(chat_id, message_id)
+
+    # -- Telegram-native UX gates: inline buttons, lifecycle emoji overrides, reaction replies --
+    #
+    # config.yaml ``telegram:`` keys (env beats YAML, mirroring ``reactions`` / TELEGRAM_REACTIONS):
+    #   buttons: true            TELEGRAM_BUTTONS          inline keyboards on clarify / approval / slash-confirm
+    #   reactions: false         TELEGRAM_REACTIONS        👀 / 👍 / 👎 lifecycle acks on the USER's message
+    #   reaction_emojis: {...}                             per-phase override (processing / success / failure)
+    #   reaction_replies: false  TELEGRAM_REACTION_REPLIES the USER's reaction on one of OUR messages → a user turn
+    # Defaults preserve pre-existing behaviour exactly: buttons on, reactions off, reaction replies off.
+
+    _DEFAULT_REACTION_REPLIES: Dict[str, str] = {"\U0001f44d": "yes", "\U0001f44c": "yes", "\U0001f44e": "no"}
+    _DEFAULT_REACTION_EMOJIS: Dict[str, Optional[str]] = {
+        "processing": "\U0001f440", "success": "\U0001f44d", "failure": "\U0001f44e"}
+    _OWN_MESSAGE_INDEX_MAX = 2000
+    _OWN_MESSAGE_SNIPPET_CHARS = 2000
+    _REACTION_REPLY_TEXT_MAX = 4096
+
+    def _buttons_enabled(self) -> bool:
+        """Inline keyboards on clarify / exec-approval / slash-confirm prompts. Default ON (the pre-gate
+        behaviour); off → the text prompts the gateway text-intercept / ``/approve`` paths already resolve."""
+        env = os.getenv("TELEGRAM_BUTTONS", "").strip().lower()
+        if env:
+            return env not in {"false", "0", "no", "off"}
+        return self._coerce_bool_extra("buttons", True)
+
+    @staticmethod
+    def _bot_settable_reaction(emoji: str) -> Optional[bool]:
+        """True/False when the SDK knows Telegram's bot-settable reaction set, None when it can't tell.
+        Bots may only set the ~70 standard reactions (👍 👎 👀 👌 🫡 …) — ✅ and ❌ are NOT among them."""
+        try:
+            from telegram.constants import ReactionEmoji
+        except Exception:
+            return None
+        try:
+            return emoji in {e.value for e in ReactionEmoji}
+        except Exception:
+            return None
+
+    def _reaction_emojis(self) -> Dict[str, Optional[str]]:
+        """Lifecycle ack emojis by phase. ``telegram.reaction_emojis`` overrides per phase; an empty/null
+        value disables that phase (the 👀 is then cleared instead of swapped). An emoji Telegram will not
+        let a bot set is kept (the API decides) but warned about once."""
+        out: Dict[str, Optional[str]] = dict(self._DEFAULT_REACTION_EMOJIS)
+        extra = getattr(getattr(self, "config", None), "extra", None) or {}
+        raw = extra.get("reaction_emojis")
+        if isinstance(raw, dict):
+            for phase in tuple(out):
+                if phase not in raw:
+                    continue
+                value = raw[phase]
+                value = str(value).strip() if value is not None else ""
+                out[phase] = value or None
+                if value and self._bot_settable_reaction(value) is False:
+                    warned = self.__dict__.setdefault("_unsettable_reaction_warned", set())
+                    if value not in warned:
+                        warned.add(value)
+                        logger.warning(
+                            "[%s] reaction_emojis.%s=%r is not in Telegram's bot-settable reaction set; "
+                            "Telegram will reject it (use 👍/👎/👀/👌/🫡 …)", self.name, phase, value)
+        return out
+
+    @staticmethod
+    def _is_reaction_reply_event(event: Any) -> bool:
+        return bool((getattr(event, "metadata", None) or {}).get("telegram_reaction_reply"))
+
+    @staticmethod
+    def _parse_reaction_reply_config(raw: Any) -> Dict[str, str]:
+        """``reaction_replies`` → ``{reaction_key: reply_text}``. ``true`` = built-in map (👍/👌 → "yes",
+        👎 → "no"); falsy/absent = off; a mapping = the user's map (keys: unicode emoji or
+        ``custom:<custom_emoji_id>``; values: non-empty text, ``/slash`` values run as commands). Strings
+        (env) may be true/false or JSON. Anything unparseable → OFF with a warning, never a surprise turn."""
+        if raw is None or raw is False:
+            return {}
+        if raw is True:
+            return dict(TelegramAdapter._DEFAULT_REACTION_REPLIES)
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text or text.lower() in {"false", "0", "no", "off"}:
+                return {}
+            if text.lower() in {"true", "1", "yes", "on", "default"}:
+                return dict(TelegramAdapter._DEFAULT_REACTION_REPLIES)
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                logger.warning("[Telegram] reaction_replies: unparseable value (%r…); reaction replies stay OFF", text[:40])
+                return {}
+            if isinstance(parsed, str):  # a JSON string is not a map
+                return {}
+            return TelegramAdapter._parse_reaction_reply_config(parsed)
+        if isinstance(raw, dict):
+            out: Dict[str, str] = {}
+            for key, value in raw.items():
+                key_s = str(key).strip()
+                value_s = str(value).strip() if value is not None else ""
+                if key_s and value_s:
+                    out[key_s] = value_s[: TelegramAdapter._REACTION_REPLY_TEXT_MAX]
+            return out
+        logger.warning("[Telegram] reaction_replies: unsupported type %s; reaction replies stay OFF", type(raw).__name__)
+        return {}
+
+    def _reaction_reply_map(self) -> Dict[str, str]:
+        """Effective inbound map: ``TELEGRAM_REACTION_REPLIES`` env (true/false/JSON) beats
+        ``telegram.reaction_replies``. Empty = feature off (the legacy default)."""
+        env = os.getenv("TELEGRAM_REACTION_REPLIES")
+        if env is not None and env.strip():
+            return self._parse_reaction_reply_config(env)
+        extra = getattr(getattr(self, "config", None), "extra", None) or {}
+        return self._parse_reaction_reply_config(extra.get("reaction_replies"))
+
+    def _remember_own_message(self, chat_id: Any, message_id: Any, text: Optional[str]) -> None:
+        """Index a message this bot sent (bounded LRU). Best-effort bookkeeping: never raises into a send."""
+        try:
+            if chat_id is None or message_id is None:
+                return
+            index = self.__dict__.get("_own_message_index")
+            if index is None:
+                index = self._own_message_index = OrderedDict()
+            key = (str(chat_id), str(message_id))
+            index[key] = (text or "")[: self._OWN_MESSAGE_SNIPPET_CHARS]
+            index.move_to_end(key)
+            while len(index) > self._OWN_MESSAGE_INDEX_MAX:
+                index.popitem(last=False)
+        except Exception:
+            logger.debug("[%s] own-message index update failed", self.name, exc_info=True)
+
+    def _own_message_text(self, chat_id: Any, message_id: Any) -> "tuple[bool, Optional[str]]":
+        """``(is_ours, text)`` for ``(chat_id, message_id)``: the in-process index first, then the persisted
+        rich-send index (survives restarts for rich sends). Unknown → ``(False, None)``."""
+        key = (str(chat_id), str(message_id))
+        index = self.__dict__.get("_own_message_index") or {}
+        if key in index:
+            return True, (index[key] or None)
+        try:
+            from gateway import rich_sent_store
+            text = rich_sent_store.lookup(str(chat_id), str(message_id))
+        except Exception:
+            text = None
+        return (True, text) if text else (False, None)
+
+    @staticmethod
+    def _reaction_keys(reactions: Any) -> List[str]:
+        """Stable map keys for a ReactionType sequence: unicode emoji as-is, custom emoji as
+        ``custom:<id>``; paid/unknown reaction types are dropped."""
+        keys: List[str] = []
+        if not isinstance(reactions, (list, tuple)):
+            return keys
+        for reaction in reactions[:64]:
+            emoji = getattr(reaction, "emoji", None)
+            if isinstance(emoji, str) and emoji:
+                keys.append(emoji)
+                continue
+            custom_id = getattr(reaction, "custom_emoji_id", None)
+            if TelegramAdapter._is_id_like(custom_id):
+                keys.append(f"custom:{custom_id}")
+        return keys
+
+    def _added_reaction_reply(self, message_reaction: Any, reply_map: Dict[str, str]) -> Optional["tuple[str, str]"]:
+        """First NEWLY ADDED reaction with a configured meaning → ``(key, reply_text)``; None otherwise.
+        Removals (new ⊂ old) and swaps onto an unmapped emoji never produce a turn."""
+        old_keys = set(self._reaction_keys(getattr(message_reaction, "old_reaction", None)))
+        for key in self._reaction_keys(getattr(message_reaction, "new_reaction", None)):
+            if key in old_keys:
+                continue
+            reply_text = reply_map.get(key)
+            if reply_text:
+                return key, reply_text
+        return None
+
+    async def _handle_message_reaction(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        """``message_reaction`` → an ordinary user turn when the ADDED emoji has a configured meaning.
+
+        Inert unless ``telegram.reaction_replies`` is set. The turn goes through ``handle_message`` like
+        typed text (auth, busy-session queueing, prompt caching untouched); it is never injected mid-loop.
+        Attribution: in DMs any message counts (the only other author is the user); in groups only a
+        message this bot sent (``_own_message_index``) — a 👍 on a human's message is chatter. The
+        ``gateway_platform_event`` observer in group 99 keeps firing independently. Never raises into PTB.
+        Telegram delivers these updates in DMs always and in groups only while the bot is an admin."""
+        message_reaction = getattr(update, "message_reaction", None)
+        if message_reaction is None:
+            return
+        try:
+            reply_map = self._reaction_reply_map()
+            if not reply_map:
+                return
+            hit = self._added_reaction_reply(message_reaction, reply_map)
+            if hit is None:
+                return
+            reaction_key, reply_text = hit
+            source = self._source_from_reaction_for_auth(update)  # ValueError when identity is missing
+            # Same fail-closed gate as inline buttons: strangers in a shared group must not steer a session.
+            if not self._is_callback_user_authorized(
+                    source.user_id, chat_id=source.chat_id, chat_type=source.chat_type, thread_id=None,
+                    user_name=source.user_name):
+                logger.info("[%s] Ignoring reaction %s from unauthorized user %s in chat %s",
+                            self.name, reaction_key, source.user_id, source.chat_id)
+                return
+            message_id = str(getattr(message_reaction, "message_id"))
+            is_ours, quoted = self._own_message_text(source.chat_id, message_id)
+            if source.chat_type != "dm" and not is_ours:
+                logger.debug("[%s] Reaction %s on non-bot message %s in %s chat %s ignored",
+                             self.name, reaction_key, message_id, source.chat_type, source.chat_id)
+                return
+            # Framed as a user turn: with a quote the gateway renders
+            # [Replying to your previous message: "…"]; without one the text says what happened.
+            text = reply_text if quoted else f"[Reacted {reaction_key} to an earlier message in this chat] {reply_text}"
+            when = getattr(message_reaction, "date", None)
+            event = MessageEvent(
+                text=text, message_type=MessageType.TEXT, user_id=source.user_id, user_name=source.user_name,
+                source=source, raw_message=message_reaction, message_id=message_id,
+                platform_update_id=getattr(update, "update_id", None),
+                reply_to_message_id=message_id, reply_to_text=quoted, reply_to_is_own_message=bool(is_ours),
+                metadata={"telegram_reaction_reply": True, "telegram_reaction": reaction_key,
+                          "telegram_reaction_target_message_id": message_id},
+                timestamp=when if isinstance(when, datetime) else datetime.now())
+            logger.info("[%s] Reaction %s on message %s in chat %s → user turn %r",
+                        self.name, reaction_key, message_id, source.chat_id, reply_text[:40])
+            await self.handle_message(event)
+        except ValueError as exc:
+            logger.debug("[%s] reaction reply skipped: %s", self.name, exc)
+        except Exception:
+            logger.warning("[%s] reaction reply handling failed", self.name, exc_info=True)
 
 
 # -- Plugin registration glue: register(ctx) plus the hook implementations (adapter factory, YAML→env/extra
@@ -6527,6 +6789,12 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         ("ignored_threads", "TELEGRAM_IGNORED_THREADS", True)):
         _bridge_gate(key, env, telegram_cfg.get(key), seed_extra=seed)
     _bridge_lower("reactions", "TELEGRAM_REACTIONS")
+    # Telegram-native UX gates: buttons (env parity with reactions), reaction_replies / reaction_emojis
+    # (structured → extra only; TELEGRAM_REACTION_REPLIES may still override with true/false/JSON).
+    _bridge_lower("buttons", "TELEGRAM_BUTTONS")
+    for _key in ("buttons", "reaction_replies", "reaction_emojis"):
+        if _key in telegram_cfg:
+            extras.setdefault(_key, telegram_cfg[_key])
     if "proxy_url" in telegram_cfg:
         _set_env("TELEGRAM_PROXY", str(telegram_cfg["proxy_url"]).strip())
     _telegram_extra = telegram_cfg.get("extra") if isinstance(telegram_cfg.get("extra"), dict) else {}
