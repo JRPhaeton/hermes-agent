@@ -61,7 +61,7 @@ jobs:
       review_status: ${{ steps.emit-status.outputs.review_status }}
     steps:
       - name: Checkout
-        uses: useblacksmith/checkout@v1
+        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
           ref: ${{ inputs.commit }}
           fetch-depth: 0
@@ -165,7 +165,7 @@ jobs:
       review_status: ${{ steps.emit-status.outputs.review_status }}
     steps:
       - name: Checkout
-        uses: useblacksmith/checkout@v1
+        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
           ref: ${{ inputs.commit }}
           fetch-depth: 0
