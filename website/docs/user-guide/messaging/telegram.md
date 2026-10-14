@@ -1267,6 +1267,65 @@ Unlike Discord (where reactions are additive), Telegram's Bot API replaces all b
 If the bot doesn't have permission to add reactions in a group, the reaction calls fail silently and message processing continues normally.
 :::
 
+`reactions_enabled: true` is accepted as an alias of `reactions: true`.
+
+### Reaction replies (`reaction_replies`)
+
+Reading reactions is a separate opt-in. With `reaction_replies` set, an emoji you put on **one of the
+bot's own messages** reaches the agent as a normal user turn, so a 👍 on a proposed plan is a "yes"
+without typing anything:
+
+```yaml
+telegram:
+  # Opt-in. false/absent (default) = reactions are only observed by plugins, never answered.
+  # true = the default map: 👍 and 👌 → "yes", 👎 → "no".
+  reaction_replies: true
+  # Or your own map — unmapped emojis never start a turn. A reply that starts with "/" is
+  # dispatched as that command, so a reaction can answer an approval prompt.
+  # reaction_replies:
+  #   "👍": "yes"
+  #   "👎": "no"
+  #   "🤔": "explain the trade-offs before I decide"
+  #   "👌": "/approve"
+```
+
+Environment equivalent: `TELEGRAM_REACTION_REPLIES` (`true`, a JSON object, or `👍=yes, 👎=no` pairs).
+
+Behavior:
+
+- The turn's text is `[reaction 👍] yes` and it replies to the reacted-to message, so the agent sees
+  `[Replying to your previous message: "…"]` with what it had said. Mapped values starting with `/`
+  are sent verbatim (`/approve`), through the same bypass path a typed command takes.
+- Only reactions on messages **this bot sent** route (Telegram reports neither the author nor the
+  text of a reacted-to message; the gateway keeps a bounded index of what it sent, plus the
+  persisted rich-send index). Reactions on your own or other people's messages are ignored.
+- The reactor is the turn's user: **the same authorization as a button tap applies** — a stranger's
+  👍 cannot drive the agent, and the bot's own 👀/👍 lifecycle reactions never feed back.
+- Removing a reaction does nothing; swapping 👍 → 👎 sends the new one. Custom (Premium) emoji
+  carry no unicode and are ignored. ✅ and ❌ are not in Telegram's standard reaction set, which is
+  why the default map uses 👍/👌/👎.
+- If the session is busy the reaction turn queues like any other message; the lifecycle 👀/👍 is
+  not placed on the bot's own message for these turns.
+- Works in polling and webhook mode (`message_reaction` is already in `allowed_updates`), and the
+  `gateway_platform_event` reaction hook still fires for plugins.
+
+### Inline buttons (`buttons_enabled`)
+
+Clarify questions, command approvals and destructive slash-command confirmations render as inline
+keyboards by default (`cl:`, `ea:`, `sc:` callbacks; the tap is acknowledged with
+`answerCallbackQuery` and the keyboard is removed). To fall back to the legacy text prompts —
+numbered list answered by typing the number, `/approve` / `/deny`, `/approve` / `/always` /
+`/cancel` — turn them off:
+
+```yaml
+telegram:
+  buttons_enabled: false   # default true; env: TELEGRAM_INLINE_BUTTONS=false
+```
+
+A clarify button tapped **after** its question expired (clarify timeout, gateway restart) is not
+lost: the chosen option is sent to the agent as a new message replying to the question, and the
+prompt is edited to say so.
+
 ## Per-Channel Prompts
 
 Assign ephemeral system prompts to specific Telegram groups or forum topics. The prompt is injected at runtime on every turn — never persisted to transcript history — so changes take effect immediately.

@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import inspect
 import json
+from collections import OrderedDict
 import logging
 import os
 import html as _html
@@ -254,6 +255,26 @@ def check_telegram_requirements() -> bool:
         return False
     TELEGRAM_AVAILABLE = True
     return True
+
+
+class _BoundedIdSet:
+    """Insertion-ordered set that forgets its oldest members past ``maxlen``."""
+
+    def __init__(self, maxlen: int):
+        self._maxlen = max(1, int(maxlen))
+        self._items: "OrderedDict[str, None]" = OrderedDict()
+
+    def add(self, item: str) -> None:
+        self._items.pop(item, None)
+        self._items[item] = None
+        while len(self._items) > self._maxlen:
+            self._items.popitem(last=False)
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
 
 
 # Every char MarkdownV2 requires backslash-escaped outside code spans/fences.
@@ -1437,6 +1458,7 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id = getattr(msg, "message_id", None)
         if message_id is not None:
             self._record_rich_sent(chat_id, message_id, content)
+            self._remember_sent_text(chat_id, message_id, content, thread_id)
         return SendResult(success=True, message_id=str(message_id) if message_id is not None else None)
 
     def _rich_payload_base(self, chat_id: str, content: str) -> Dict[str, Any]:
@@ -2569,7 +2591,17 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _on_platform_update(self, update, context) -> None:
         """Catch-all PTB handler (group 99) firing ``gateway_platform_event`` per inbound update with a
-        stable envelope (no raw SDK objects) and an internal auth source. Never raises into PTB."""
+        stable envelope (no raw SDK objects) and an internal auth source. Never raises into PTB.
+
+        Reaction replies ride the same catch-all (one observer registration, #64176) and do not depend
+        on a plugin subscriber: an opted-in ``message_reaction`` on one of the bot's messages becomes a
+        mapped user turn *before* the observer hook sees the event."""
+        mr = getattr(update, "message_reaction", None)
+        if mr is not None:
+            try:
+                await self._handle_reaction_reply(mr)
+            except Exception:
+                logger.debug("[%s] reaction reply dispatch error", self.name, exc_info=True)
         handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]] = getattr(self, "_platform_event_handler", None)
         if handler is None:
             return
@@ -2693,7 +2725,8 @@ class TelegramAdapter(BasePlatformAdapter):
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         # Inline command picker; inert until the owner enables inline mode via BotFather /setinline.
         app.add_handler(InlineQueryHandler(self._handle_inline_query))
-        # gateway_platform_event observer: group 99 observes alongside, never displaces, core handlers.
+        # gateway_platform_event observer (+ reaction replies): group 99 observes alongside, never displaces,
+        # core handlers.
         app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
 
     async def _build_ptb_requests(self) -> tuple:
@@ -3378,6 +3411,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     return outcome
                 msg, used_thread_fallback = outcome
                 message_ids.append(str(msg.message_id))
+            self._remember_sent_text(chat_id, message_ids, content, thread_id)
             await self._retrigger_typing(chat_id, metadata)
             return SendResult(
                 success=True, message_id=message_ids[0] if message_ids else None,
@@ -3444,6 +3478,16 @@ class TelegramAdapter(BasePlatformAdapter):
         return False
 
     async def edit_message(
+        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False, metadata: Optional[Dict[str, Any]] = None,
+   ) -> SendResult:
+        """Edit a previously sent Telegram message; a finalized edit is remembered as sent text so a later
+        reaction / late button tap on it still resolves to what the bot said."""
+        result = await self._edit_message_impl(chat_id, message_id, content, finalize=finalize, metadata=metadata)
+        if finalize and getattr(result, "success", False):
+            self._remember_sent_text(chat_id, getattr(result, "message_id", None) or message_id, content, self._metadata_thread_id(metadata))
+        return result
+
+    async def _edit_message_impl(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False, metadata: Optional[Dict[str, Any]] = None,
    ) -> SendResult:
         """Edit a previously sent Telegram message.
@@ -3766,6 +3810,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_markup=keyboard, thread_id=thread_id, metadata=metadata, reply_to_mode=reply_to_mode)
             if on_sent is not None:
                 on_sent(msg)
+            self._remember_sent_text(chat_id, getattr(msg, "message_id", None), text, thread_id)
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] %s failed: %s", self.name, what, _redact_telegram_error_text(e))
@@ -3805,6 +3850,9 @@ class TelegramAdapter(BasePlatformAdapter):
         smart_denied: bool = False) -> SendResult:
         """Send an inline-keyboard approval prompt; buttons call ``resolve_gateway_approval()`` like the
         text ``/approve`` flow."""
+        if not self._buttons_enabled():
+            # Inline buttons off: report "not sent" so the runner posts its plain-text /approve, /deny prompt.
+            return SendResult(success=False, error="inline buttons disabled")
         def build():
             text = self._format_exec_approval(command, description, smart_denied)
             # Short monotonic ids in callback_data map back to session_key.
@@ -3828,6 +3876,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Render a three-button slash-command confirmation prompt."""
+        if not self._buttons_enabled():
+            return SendResult(success=False, error="Not supported")  # gateway text fallback (/approve, /always, /cancel)
         def build():
             keyboard = InlineKeyboardMarkup([
                 [
@@ -3845,6 +3895,9 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Render a clarify prompt: numbered buttons per choice plus "✏️ Other (type answer)" (flips to
         text-capture mode); without choices, plain question and the gateway text-intercept captures."""
+        if not self._buttons_enabled():
+            # Legacy numbered-list prompt; the gateway text-intercept resolves the typed answer.
+            return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata=metadata)
         def build():
             text = f"❓ {_html.escape(question)}"
             keyboard = None
@@ -4369,19 +4422,27 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
 
     async def _handle_clarify_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
-        """``cl:<clarify_id>:<idx|other>`` — resolve a clarify prompt or flip to text capture."""
+        """``cl:<clarify_id>:<idx|other>`` — resolve a clarify prompt or flip to text capture.
+
+        A numeric tap that lands after the prompt is gone (clarify timeout, gateway restart) is not stranded
+        behind a "please /retry" notice: the chosen option is routed as a normal user turn replying to the
+        prompt, so the answer still reaches the agent (queued if the session is busy)."""
         parts = data.split(":", 2)
         if len(parts) != 3:
             return
         clarify_id = parts[1]
         choice_token = parts[2]
-        session_key = await self._claim_callback_state(
-            query, cb, self._clarify_state, clarify_id, "⛔ You are not authorized to answer this prompt.",
-            "This prompt has already been resolved.", pop=False)
-        if not session_key:
+        if not await self._callback_authorized(query, cb, "⛔ You are not authorized to answer this prompt."):
             return
+        if clarify_id in self._clarify_resolved_ids():
+            await query.answer(text="This prompt has already been resolved.")
+            return
+        session_key = self._clarify_state.get(clarify_id)
         user_display = getattr(query.from_user, "first_name", "User")
         if choice_token == "other":
+            if not session_key:
+                await query.answer(text="This prompt has already been resolved.")
+                return
             # Flip to text-capture: the gateway's text-intercept resolves the clarify with the next message.
             # Do NOT pop _clarify_state yet — still needed if the entry gets cleared by something else.
             flipped = False
@@ -4405,17 +4466,7 @@ class TelegramAdapter(BasePlatformAdapter):
         except (ValueError, TypeError):
             await query.answer(text="Invalid choice.")
             return
-        resolved_text: Optional[str] = None
-        try:
-            from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
-            entry = _clarify_entries.get(clarify_id)
-            if entry and entry.choices and 0 <= idx < len(entry.choices):
-                resolved_text = entry.choices[idx]
-        except Exception:
-            resolved_text = None
-        if resolved_text is None:
-            # Race (timeout / session reset): echo the index so the agent sees an intentional response.
-            resolved_text = f"choice {idx + 1}"
+        resolved_text = self._clarify_choice_text(clarify_id, idx, getattr(getattr(query, "message", None), "text", None))
         self._clarify_state.pop(clarify_id, None)
         try:
             from tools.clarify_gateway import resolve_gateway_clarify
@@ -4424,14 +4475,70 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
             resolved = False
         if resolved:
+            self._clarify_resolved_ids().add(clarify_id)
             await query.answer(text=f"✓ {resolved_text[:60]}")
             await self._edit_html_quiet(
                 query, f"❓ {_html.escape(query.message.text or '')}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}")
             logger.info("Telegram clarify button resolved (id=%s, choice=%r, user=%s)", clarify_id, resolved_text, user_display)
-        else:
-            # Entry evicted / gateway restarted between ask and tap.
-            await self._notify_clarify_expired(query, user_display)
-            logger.warning("Telegram clarify button: resolve_gateway_clarify returned False (id=%s)", clarify_id)
+            return
+        # Entry evicted / gateway restarted between ask and tap: deliver the answer as a fresh user turn.
+        if await self._route_late_choice_as_turn(query, resolved_text, user_display):
+            self._clarify_resolved_ids().add(clarify_id)
+            logger.info("Telegram clarify button answered late (id=%s, choice=%r) — routed as a user turn", clarify_id, resolved_text)
+            return
+        await self._notify_clarify_expired(query, user_display)
+        logger.warning("Telegram clarify button: resolve_gateway_clarify returned False (id=%s)", clarify_id)
+
+    _CLARIFY_RESOLVED_IDS_MAX = 512
+
+    def _clarify_resolved_ids(self) -> "_BoundedIdSet":
+        """Recently resolved clarify ids (bounded): a second tap on a prompt whose keyboard edit failed must
+        not become a duplicate late turn. Lives in ``__dict__`` so ``object.__new__`` test adapters work."""
+        ids = self.__dict__.get("_clarify_resolved_ids_store")
+        if ids is None:
+            ids = self.__dict__["_clarify_resolved_ids_store"] = _BoundedIdSet(self._CLARIFY_RESOLVED_IDS_MAX)
+        return ids
+
+    @staticmethod
+    def _clarify_choice_text(clarify_id: str, idx: int, prompt_text: Optional[str]) -> str:
+        """Text of choice ``idx``: the pending entry when still registered, else the numbered line the prompt
+        body carries (``N. option`` — the body is the durable copy after a restart), else ``choice N``."""
+        try:
+            from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
+            entry = _clarify_entries.get(clarify_id)
+            if entry and entry.choices and 0 <= idx < len(entry.choices):
+                return str(entry.choices[idx])
+        except Exception:
+            pass
+        for line in (prompt_text or "").splitlines():
+            m = re.match(r"^\s*(\d+)\.\s+(.+?)\s*$", line)
+            if m and int(m.group(1)) == idx + 1:
+                return m.group(2)
+        return f"choice {idx + 1}"
+
+    async def _route_late_choice_as_turn(self, query, text: str, user_display: str) -> bool:
+        """Deliver a late clarify tap as a normal user turn replying to the prompt; False when the callback
+        carries no usable chat (nothing to route)."""
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        user = getattr(query, "from_user", None)
+        if message is None or chat is None or user is None or getattr(chat, "id", None) is None:
+            return False
+        try:
+            thread_id = self._effective_message_thread_id(message)
+        except Exception:
+            thread_id = None
+        prompt_text = getattr(message, "text", None) or ""
+        event = self._build_synthetic_turn_event(
+            chat, user, text=text, anchor_message_id=getattr(message, "message_id", None), anchor_text=prompt_text or None,
+            thread_id=thread_id, metadata={"telegram_late_clarify_answer": True})
+        with contextlib.suppress(Exception):
+            await query.answer(text=f"✓ {text[:60]}")
+        await self._edit_html_quiet(
+            query, f"❓ {_html.escape(prompt_text)}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(text)}\n"
+            f"<i>(the question had expired — your answer was sent as a new message)</i>")
+        await self.handle_message(event)
+        return True
 
     async def _handle_update_prompt_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         """``update_prompt:<y|n>`` — forward the answer to the update process."""
@@ -6377,7 +6484,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
-        if not self._reactions_enabled():
+        if not self._reactions_enabled() or self._is_reaction_turn(event):
             return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
@@ -6387,7 +6494,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction (set_message_reaction
         replaces, not adds); CANCELLED explicitly clears the 👀."""
-        if not self._reactions_enabled():
+        if not self._reactions_enabled() or self._is_reaction_turn(event):
             return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
@@ -6397,6 +6504,201 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._clear_reactions(chat_id, message_id)
         else:
             await self._set_reaction(chat_id, message_id, "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e")
+
+
+    # -- Inline-button gate, reaction replies (inbound), sent-text index --
+
+    _DEFAULT_REACTION_REPLIES: Dict[str, str] = {"👍": "yes", "👌": "yes", "👎": "no"}
+    _SENT_TEXT_INDEX_MAX = 2000
+
+    @staticmethod
+    def _buttons_enabled() -> bool:
+        """Inline keyboards on clarify / exec-approval / slash-confirm prompts (``buttons_enabled`` /
+        ``TELEGRAM_INLINE_BUTTONS``, default on). Off = the legacy numbered-list and ``/approve`` text prompts."""
+        return os.getenv("TELEGRAM_INLINE_BUTTONS", "true").strip().lower() not in {"false", "0", "no", "off"}
+
+    @staticmethod
+    def _is_reaction_turn(event: Any) -> bool:
+        """True for a turn synthesized from a reaction: lifecycle 👀/👍 must not land on the bot's own message."""
+        metadata = getattr(event, "metadata", None)
+        return bool(isinstance(metadata, dict) and metadata.get("telegram_reaction_turn"))
+
+    @staticmethod
+    def _normalize_reaction_emoji(emoji: Any) -> str:
+        """Strip variation selectors so ``❤️`` (config) matches ``❤`` (Bot API) and vice versa."""
+        return "".join(ch for ch in str(emoji or "").strip() if ch not in {"\ufe0f", "\ufe0e"})
+
+    @classmethod
+    def _clean_reaction_map(cls, raw: Dict[Any, Any]) -> Optional[Dict[str, str]]:
+        cleaned: Dict[str, str] = {}
+        for key, value in raw.items():
+            emoji = cls._normalize_reaction_emoji(key)
+            reply = str(value or "").strip()
+            if emoji and reply:
+                cleaned[emoji] = reply
+        return cleaned or None
+
+    @classmethod
+    def _parse_reaction_reply_map(cls, raw: Any) -> Optional[Dict[str, str]]:
+        """``reaction_replies`` → ``{emoji: reply}`` or None (off, the default).
+
+        ``true`` = the documented default map (👍/👌 → "yes", 👎 → "no"); a mapping = custom; as text
+        (env) either a JSON object or ``👍=yes, 👎=no`` pairs. Unmapped emojis never start a turn."""
+        if raw is None:
+            return None
+        if isinstance(raw, bool):
+            return dict(cls._DEFAULT_REACTION_REPLIES) if raw else None
+        if isinstance(raw, dict):
+            return cls._clean_reaction_map(raw)
+        text = str(raw).strip()
+        if not text or text.lower() in {"false", "0", "no", "off", "none"}:
+            return None
+        if text.lower() in {"true", "1", "yes", "on", "all", "default"}:
+            return dict(cls._DEFAULT_REACTION_REPLIES)
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                logger.warning("[Telegram] reaction_replies is not valid JSON — reaction replies disabled")
+                return None
+            return cls._clean_reaction_map(parsed) if isinstance(parsed, dict) else None
+        pairs: Dict[str, str] = {}
+        for item in re.split(r"[,;\n]+", text):
+            if not item.strip():
+                continue
+            emoji, sep, reply = item.partition("=")
+            if not sep:
+                emoji, sep, reply = item.partition(":")
+            if sep:
+                pairs[emoji] = reply
+        return cls._clean_reaction_map(pairs)
+
+    def _reaction_reply_map(self) -> Optional[Dict[str, str]]:
+        """Active inbound reaction map from ``TELEGRAM_REACTION_REPLIES`` (YAML ``reaction_replies`` is bridged)."""
+        return self._parse_reaction_reply_map(os.getenv("TELEGRAM_REACTION_REPLIES", "") or None)
+
+    def _sent_text_index(self) -> "OrderedDict":
+        idx = self.__dict__.get("_sent_text_index_store")
+        if idx is None:
+            idx = self.__dict__["_sent_text_index_store"] = OrderedDict()
+        return idx
+
+    def _remember_sent_text(self, chat_id: Any, message_ids: Any, text: Optional[str], thread_id: Any = None) -> None:
+        """Index text the bot sent by ``(chat_id, message_id)`` (bounded LRU). ``message_reaction`` updates
+        carry neither author nor text, so this is how a reaction is tied to *what the bot said* — and the
+        proof the reacted-to message is ours. Best-effort: never breaks a send."""
+        try:
+            if chat_id is None or not text:
+                return
+            ids = message_ids if isinstance(message_ids, (list, tuple, set)) else [message_ids]
+            idx = self._sent_text_index()
+            for mid in ids:
+                if mid is None:
+                    continue
+                key = (str(chat_id), str(mid))
+                idx.pop(key, None)
+                idx[key] = {"text": str(text)[:2000], "thread_id": str(thread_id) if thread_id is not None else None}
+            while len(idx) > self._SENT_TEXT_INDEX_MAX:
+                idx.popitem(last=False)
+        except Exception:
+            logger.debug("[%s] sent-text index update failed", self.name, exc_info=True)
+
+    def _lookup_sent_text(self, chat_id: Any, message_id: Any) -> Optional[Dict[str, Any]]:
+        """``{"text", "thread_id"}`` for a message the bot sent, or None (unknown / not ours). Falls back to
+        the persisted rich-send index so rich finals survive a gateway restart."""
+        entry = self._sent_text_index().get((str(chat_id), str(message_id)))
+        if entry:
+            return dict(entry)
+        try:
+            from gateway import rich_sent_store
+            text = rich_sent_store.lookup(str(chat_id), str(message_id))
+        except Exception:
+            text = None
+        return {"text": text, "thread_id": None} if text else None
+
+    def _build_synthetic_turn_event(
+        self, chat: Any, user: Any, *, text: str, anchor_message_id: Any, anchor_text: Optional[str],
+        thread_id: Optional[str], metadata: Optional[Dict[str, Any]] = None) -> MessageEvent:
+        """A user turn without an inbound Telegram message behind it (reaction reply, late button tap). Routed
+        exactly like ``_build_message_event``: same chat-type mapping, same session key; the bot message it
+        answers rides as reply context (``reply_to_is_own_message``) so the agent sees what was answered."""
+        telegram_chat_type = self._chat_type_str(chat)
+        chat_type = "group" if telegram_chat_type in {"group", "supergroup"} else ("channel" if telegram_chat_type == "channel" else "dm")
+        has_full_name = isinstance(getattr(chat, "full_name", None), str)
+        user_name = getattr(user, "full_name", None) or getattr(user, "title", None) or (chat.full_name if has_full_name and chat_type == "dm" else None)
+        source = self.build_source(
+            chat_id=str(chat.id), chat_name=getattr(chat, "title", None) or (chat.full_name if has_full_name else None),
+            chat_type=chat_type, user_id=str(user.id), user_name=str(user_name) if user_name else None,
+            thread_id=str(thread_id) if thread_id is not None else None,
+            message_id=str(anchor_message_id) if anchor_message_id is not None else None, is_bot=False)
+        anchor = str(anchor_message_id) if anchor_message_id is not None else None
+        return MessageEvent(
+            text=text, message_type=MessageType.TEXT, source=source, raw_message=None, message_id=anchor,
+            reply_to_message_id=anchor if anchor_text else None, reply_to_text=anchor_text or None,
+            reply_to_is_own_message=bool(anchor_text), metadata=dict(metadata or {}))
+
+    @classmethod
+    def _added_reaction_emojis(cls, mr: Any) -> List[str]:
+        """Unicode emojis present in ``new_reaction`` but not ``old_reaction`` (a removal adds nothing;
+        custom emoji carry no unicode and are ignored)."""
+        def _emojis(reactions: Any) -> List[str]:
+            out: List[str] = []
+            for r in (reactions or []) if isinstance(reactions, (list, tuple)) else []:
+                emoji = getattr(r, "emoji", None)
+                if isinstance(emoji, str) and emoji:
+                    out.append(cls._normalize_reaction_emoji(emoji))
+            return out
+        old = set(_emojis(getattr(mr, "old_reaction", None)))
+        return [e for e in _emojis(getattr(mr, "new_reaction", None)) if e not in old]
+
+    async def _handle_reaction_reply(self, mr: Any) -> bool:
+        """Route a ``MessageReactionUpdated`` into the agent; True when a turn was started.
+
+        Order of gates (each a silent drop, debug-logged): feature off → no actor / bot actor → nothing
+        added (removal, custom emoji) → emoji unmapped → reacted-to message not one the bot sent (Telegram
+        gives neither author nor text, the sent index is the proof) → reactor fails the same auth chain as
+        a button tap. A reply starting with ``/`` is dispatched verbatim as that command (e.g. 👍 → /approve);
+        anything else is framed ``[reaction 👍] yes`` with the bot message as reply context."""
+        reply_map = self._reaction_reply_map()
+        if not reply_map:
+            return False
+        user = getattr(mr, "user", None) or getattr(mr, "actor_chat", None)
+        chat = getattr(mr, "chat", None)
+        message_id = getattr(mr, "message_id", None)
+        if user is None or chat is None or message_id is None or getattr(chat, "id", None) is None:
+            return False
+        if getattr(user, "is_bot", False):
+            return False
+        bot_id = getattr(self._bot, "id", None) if self._bot else None
+        if bot_id is not None and getattr(user, "id", None) == bot_id:
+            return False
+        added = self._added_reaction_emojis(mr)
+        if not added:
+            return False
+        emoji, reply = next(((e, reply_map[e]) for e in added if e in reply_map), (None, None))
+        if reply is None:
+            logger.debug("[%s] reaction %s carries no mapped reply — ignored", self.name, added)
+            return False
+        chat_id = str(chat.id)
+        sent = self._lookup_sent_text(chat_id, message_id)
+        if sent is None:
+            logger.debug("[%s] reaction %s on message %s/%s is not on a known bot message — ignored", self.name, emoji, chat_id, message_id)
+            return False
+        thread_id = sent.get("thread_id")
+        user_id = str(getattr(user, "id", "") or "")
+        user_name = getattr(user, "username", None) or getattr(user, "full_name", None) or getattr(user, "title", None)
+        if not self._is_callback_user_authorized(
+                user_id, chat_id=chat_id, chat_type=self._chat_type_str(chat) or None,
+                thread_id=thread_id, user_name=str(user_name) if user_name else None):
+            logger.info("[%s] reaction %s from unauthorized user %s ignored", self.name, emoji, user_id)
+            return False
+        text = reply if reply.startswith("/") else f"[reaction {emoji}] {reply}"
+        event = self._build_synthetic_turn_event(
+            chat, user, text=text, anchor_message_id=message_id, anchor_text=sent.get("text"), thread_id=thread_id,
+            metadata={"telegram_reaction_turn": True, "telegram_reaction": {"emoji": emoji, "reply": reply, "message_id": str(message_id)}})
+        logger.info("[%s] reaction %s → %r turn for chat %s (message %s)", self.name, emoji, reply, chat_id, message_id)
+        await self.handle_message(event)
+        return True
 
 
 # -- Plugin registration glue: register(ctx) plus the hook implementations (adapter factory, YAML→env/extra
@@ -6527,6 +6829,17 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         ("ignored_threads", "TELEGRAM_IGNORED_THREADS", True)):
         _bridge_gate(key, env, telegram_cfg.get(key), seed_extra=seed)
     _bridge_lower("reactions", "TELEGRAM_REACTIONS")
+    if "reactions" not in telegram_cfg:
+        _bridge_lower("reactions_enabled", "TELEGRAM_REACTIONS")  # alias
+    _bridge_lower("buttons_enabled", "TELEGRAM_INLINE_BUTTONS")
+    if "reaction_replies" in telegram_cfg:
+        _rr = telegram_cfg["reaction_replies"]
+        if isinstance(_rr, bool):
+            _set_env("TELEGRAM_REACTION_REPLIES", "true" if _rr else "false")
+        elif isinstance(_rr, dict):
+            _set_env("TELEGRAM_REACTION_REPLIES", _json.dumps(_rr, ensure_ascii=False))
+        elif _rr is not None:
+            _set_env("TELEGRAM_REACTION_REPLIES", str(_rr).strip())
     if "proxy_url" in telegram_cfg:
         _set_env("TELEGRAM_PROXY", str(telegram_cfg["proxy_url"]).strip())
     _telegram_extra = telegram_cfg.get("extra") if isinstance(telegram_cfg.get("extra"), dict) else {}
