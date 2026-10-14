@@ -60,6 +60,8 @@ jobs:
 
       - name: Probe live docs search
         id: probe
+        # Bounded so a hung probe still leaves the alert step time to run.
+        timeout-minutes: 9
         env:
           PLAYWRIGHT_DIR: ${{ runner.temp }}/pw
         run: |
@@ -80,9 +82,18 @@ jobs:
           REASON: ${{ steps.probe.outputs.reason }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          prev=$(gh run list -R "$GITHUB_REPOSITORY" --workflow docs-search-monitor.yml \
-                   --status completed --limit 10 --json databaseId,conclusion \
-                   --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID and (.conclusion == \"success\" or .conclusion == \"failure\"))][0].conclusion // \"success\"")
+          # Previous verdict = the last run whose PROBE step ran, read from the
+          # step itself. The run's overall conclusion would also count setup
+          # failures (e.g. a Chromium download), which say nothing about search.
+          prev=success
+          for id in $(gh run list -R "$GITHUB_REPOSITORY" --workflow docs-search-monitor.yml \
+                        --status completed --limit 15 --json databaseId --jq '.[].databaseId'); do
+            [ "$id" = "$GITHUB_RUN_ID" ] && continue
+            c=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \
+                  --jq '[.jobs[].steps[] | select(.name == "Probe live docs search") | .conclusion][0] // ""')
+            if [ "$c" = success ] || [ "$c" = failure ]; then prev=$c; break; fi
+          done
+          echo "previous probe verdict: $prev"
           hour=$(date -u +%H)
           if [ "$TEST_ALERT" = true ]; then
             text="Test alert from the docs search monitor (probe: $OUTCOME). $RUN_URL"

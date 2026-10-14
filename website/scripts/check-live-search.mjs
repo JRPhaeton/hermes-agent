@@ -23,6 +23,11 @@ const ORIGIN = new URL(DOCS_URL).origin;
 // Terms that must always match many pages; one per major area of the docs.
 const QUERIES = ['telegram', 'install', 'skills'];
 const MIN_HITS = 5;
+// Every request (body included) gets a deadline, and the whole probe gets one,
+// so a slow-drip server fails the check with time left to retry and alert
+// instead of running into the job's timeout.
+const REQUEST_TIMEOUT_MS = 20_000;
+const PROBE_DEADLINE_MS = 240_000;
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36 hermes-docs-search-monitor';
 
 const failures = [];
@@ -33,7 +38,11 @@ const fail = (msg) => {
 const ok = (msg) => console.log(`ok   ${msg}`);
 
 async function get(url, headers = {}) {
-  const res = await fetch(url, { headers: { 'user-agent': UA, ...headers }, redirect: 'follow' });
+  const res = await fetch(url, {
+    headers: { 'user-agent': UA, ...headers },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
   return { res, body: await res.text() };
 }
 
@@ -59,12 +68,20 @@ async function readDeployedConfig() {
     return null;
   }
   const js = (await get(new URL(bundle, ORIGIN).href)).body;
-  const algolia = js.match(/algolia:\{appId:"([^"]+)",apiKey:"([^"]+)",indexName:"([^"]+)"/);
-  if (!algolia) {
-    fail(`deployed bundle ${bundle} has no Algolia config; search is not configured on the live site`);
+  // Theme code destructures `algolia:{...}` too; take the block that carries
+  // all three fields, each read on its own so key order and quoting in the
+  // compiled config do not matter.
+  const field = (cfg, name) => cfg.match(new RegExp(`["']?${name}["']?\\s*:\\s*(["'])([^"']+)\\1`))?.[2];
+  const [appId, apiKey, indexName] =
+    js
+      .split('algolia:{')
+      .slice(1)
+      .map((cfg) => ['appId', 'apiKey', 'indexName'].map((name) => field(cfg.slice(0, 2000), name)))
+      .find((fields) => fields.every(Boolean)) || [];
+  if (!appId) {
+    fail(`deployed bundle ${bundle} has no complete Algolia config; search is not configured on the live site`);
     return null;
   }
-  const [, appId, apiKey, indexName] = algolia;
   ok(`deployed config: app ${appId}, index "${indexName}" (from ${bundle})`);
   return { appId, apiKey, indexName };
 }
@@ -79,6 +96,7 @@ async function checkAlgolia({ appId, apiKey, indexName }) {
       referer: `${DOCS_URL}/`,
       'content-type': 'application/json',
     },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     body: JSON.stringify({
       requests: QUERIES.map((query) => ({ indexName, query, hitsPerPage: 3, attributesToRetrieve: ['url'] })),
     }),
@@ -138,12 +156,17 @@ async function checkBrowser() {
   }
 }
 
-async function main() {
+async function probe() {
   const config = await readDeployedConfig();
   if (config) await checkHitPagesOpen(await checkAlgolia(config));
   if (!process.argv.includes('--no-browser')) {
     await checkBrowser().catch((e) => fail(`browser check crashed: ${e.message.split('\n')[0]}`));
   }
+}
+
+// One exit path for clean failures, thrown errors and the deadline, so the
+// alert always carries the real reason.
+function finish() {
   if (process.env.GITHUB_STEP_SUMMARY) {
     const lines = failures.length ? failures.map((f) => `- ${f}`) : ['- all checks passed'];
     appendFileSync(process.env.GITHUB_STEP_SUMMARY, `### Docs search (${DOCS_URL})\n${lines.join('\n')}\n`);
@@ -154,7 +177,10 @@ async function main() {
   process.exit(failures.length ? 1 : 0);
 }
 
-main().catch((e) => {
-  fail(`probe crashed: ${e.message}`);
-  process.exit(1);
-});
+setTimeout(() => {
+  fail(`probe did not finish within ${PROBE_DEADLINE_MS / 1000}s`);
+  finish();
+}, PROBE_DEADLINE_MS).unref();
+probe()
+  .catch((e) => fail(`probe crashed: ${e.cause?.message || e.message}`))
+  .finally(finish);
